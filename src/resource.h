@@ -1,0 +1,6 @@
+#pragma once
+
+#define IDI_WINDOWHOST 101
+#define IDD_SETTINGS 102
+#define IDC_PROCESS_NAMES 1001
+#define IDC_TASKBAR 1002

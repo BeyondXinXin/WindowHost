@@ -1,12 +1,16 @@
 #pragma once
 
-#include <filesystem>
 #include <string>
+#include <vector>
 
 namespace settings {
-using std::filesystem::path;
+struct Config {
+    std::vector<std::wstring> names;
+    bool reserveTaskbar = false;
+    bool watches(const std::wstring& name) const;
+};
 
-// An empty target means the user has not selected an executable yet.
-std::wstring load(path& target);
-std::wstring save(const path& target);
+std::wstring parseNames(const std::wstring& lines, Config& config);
+std::wstring load(Config& config);
+std::wstring save(const Config& config);
 }

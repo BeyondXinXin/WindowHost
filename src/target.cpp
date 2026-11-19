@@ -4,22 +4,31 @@
 #include <cstdint>
 #include <iterator>
 #include <map>
+#include <string_view>
 
 namespace target {
 namespace {
-bool sameImage(HANDLE process, const std::filesystem::path& exe)
+std::wstring imageName(HANDLE process)
 {
     wchar_t image[32768];
     DWORD length = static_cast<DWORD>(std::size(image));
-    return QueryFullProcessImageNameW(process, 0, image, &length) &&
-           CompareStringOrdinal(image, static_cast<int>(length), exe.c_str(), -1, TRUE) == CSTR_EQUAL;
+    if (!QueryFullProcessImageNameW(process, 0, image, &length))
+        return {};
+    std::wstring_view actual(image, length);
+    const auto separator = actual.find_last_of(L"\\/");
+    if (separator != actual.npos)
+        actual.remove_prefix(separator + 1);
+    return std::wstring(actual);
 }
 
-struct Search {
-    const std::filesystem::path& exe;
-    std::map<DWORD, bool> matches;
+struct ProcessWindows {
     Candidate best;
     std::int64_t area = 0;
+};
+
+struct Search {
+    const std::vector<std::wstring>& names;
+    std::map<DWORD, ProcessWindows> processes;
 };
 
 BOOL CALLBACK consider(HWND window, LPARAM param)
@@ -32,14 +41,21 @@ BOOL CALLBACK consider(HWND window, LPARAM param)
         (GetWindowLongW(window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW))
         return TRUE;
 
-    auto [it, inserted] = search.matches.try_emplace(pid, false);
+    auto [it, inserted] = search.processes.try_emplace(pid);
+    auto& record = it->second;
     if (inserted) {
         if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
-            it->second = sameImage(process, search.exe);
+            const auto actual = imageName(process);
             CloseHandle(process);
+            for (const auto& name : search.names) {
+                if (CompareStringOrdinal(name.c_str(), -1, actual.c_str(), -1, TRUE) == CSTR_EQUAL) {
+                    record.best.name = name;
+                    break;
+                }
+            }
         }
     }
-    if (!it->second)
+    if (record.best.name.empty())
         return TRUE;
     DWORD cloaked = 0;
     RECT client{};
@@ -47,9 +63,11 @@ BOOL CALLBACK consider(HWND window, LPARAM param)
         !GetClientRect(window, &client))
         return TRUE;
     const auto area = static_cast<std::int64_t>(client.right) * client.bottom;
-    if (area > search.area) {
-        search.area = area;
-        search.best = {window, pid, thread};
+    if (area > record.area) {
+        record.area = area;
+        record.best.window = window;
+        record.best.pid = pid;
+        record.best.thread = thread;
     }
     return TRUE;
 }
@@ -246,20 +264,26 @@ struct Session {
 };
 }
 
-Candidate findMainWindow(const std::filesystem::path& exe)
+std::vector<Candidate> findMainWindows(const std::vector<std::wstring>& names)
 {
-    Search search{exe, {}, {}, 0};
+    Search search{names, {}};
     EnumWindows(consider, reinterpret_cast<LPARAM>(&search));
-    return search.best;
+    std::vector<Candidate> result;
+    for (const auto& entry : search.processes) {
+        if (entry.second.best.window)
+            result.push_back(entry.second.best);
+    }
+    return result;
 }
 
-DWORD host(HWND frame, HWND viewport, Candidate candidate, const std::filesystem::path& exe, HANDLE stop)
+DWORD host(HWND frame, HWND viewport, const Candidate& candidate, HANDLE stop)
 {
     HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, candidate.pid);
     if (!process)
         return lastError();
     DWORD result = ERROR_INVALID_WINDOW_HANDLE;
-    if (sameImage(process, exe)) {
+    const auto actual = imageName(process);
+    if (CompareStringOrdinal(actual.c_str(), -1, candidate.name.c_str(), -1, TRUE) == CSTR_EQUAL) {
         const auto previous = SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(viewport));
         if (previous) {
             Session session{frame, viewport, candidate, process, stop};
