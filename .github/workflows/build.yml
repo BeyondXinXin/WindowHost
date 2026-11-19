@@ -1,0 +1,28 @@
+name: Build WindowHost
+
+on: [push]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 Release
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Configure with Visual Studio 2022
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -T v143
+
+      - name: Build WindowHost
+        run: cmake --build build --config Release --target WindowHost
+
+      - name: Upload WindowHost.exe
+        uses: actions/upload-artifact@v7
+        with:
+          path: build/Release/WindowHost.exe
+          archive: false
+          if-no-files-found: error
