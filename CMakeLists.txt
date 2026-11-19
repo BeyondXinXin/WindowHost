@@ -3,6 +3,7 @@ project(WindowHost VERSION 1.0.0 LANGUAGES CXX RC)
 
 add_executable(WindowHost WIN32
     src/main.cpp
+    src/pane.cpp
     src/appearance.cpp
     src/settings.cpp
     src/target.cpp

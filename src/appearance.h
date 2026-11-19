@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include <string>
 
 struct Appearance {
     Appearance();
@@ -25,7 +26,6 @@ private:
     HBRUSH darkMenu;
 };
 
-// Owner-drawn menu items are used only in dark mode. Standard menus handle
-// their own light and high-contrast colors, metrics and keyboard cues.
-void measureDarkMenu(HWND frame, MEASUREITEMSTRUCT& item, const wchar_t* label);
-void drawDarkMenu(HWND frame, const DRAWITEMSTRUCT& item, const wchar_t* label, const Appearance& theme);
+void measureHostMenu(HWND frame, MEASUREITEMSTRUCT& item, const std::wstring& label, bool gear);
+void drawHostMenu(HWND frame, const DRAWITEMSTRUCT& item, const std::wstring& label,
+                  bool gear, bool selected, const Appearance& theme);

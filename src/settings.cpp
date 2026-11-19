@@ -1,6 +1,8 @@
 #include "settings.h"
 
 #include <windows.h>
+#include <algorithm>
+#include <charconv>
 #include <shlobj.h>
 #include <cwchar>
 #include <fstream>
@@ -45,6 +47,30 @@ bool Config::watches(const std::wstring& name) const
             return true;
     }
     return false;
+}
+
+namespace {
+bool sameWindow(const WindowPreference& pref, const std::wstring& name, unsigned slot)
+{
+    return pref.slot == slot && CompareStringOrdinal(pref.name.c_str(), -1, name.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+}
+
+bool Config::taskbarFor(const std::wstring& name, unsigned slot) const
+{
+    for (const auto& pref : windows)
+        if (sameWindow(pref, name, slot))
+            return pref.taskbar;
+    return defaultTaskbar;
+}
+
+void Config::setTaskbar(const std::wstring& name, unsigned slot, bool enabled)
+{
+    auto it = std::find_if(windows.begin(), windows.end(), [&](const auto& pref) { return sameWindow(pref, name, slot); });
+    if (it == windows.end())
+        windows.push_back({name, slot, enabled});
+    else
+        it->taskbar = enabled;
 }
 
 std::wstring parseNames(const std::wstring& lines, Config& config)
@@ -101,7 +127,20 @@ std::wstring load(Config& config)
             if (!line.empty() && line.back() == '\r')
                 line.pop_back();
             if (line == "reserveTaskbar=1" || line == "reserveTaskbar=0") {
-                parsed.reserveTaskbar = line.back() == '1';
+                parsed.defaultTaskbar = line.back() == '1';
+            } else if (line == "layout=tabs" || line == "layout=windows") {
+                parsed.tabbed = line == "layout=tabs";
+            } else if (line.rfind("taskbar\t", 0) == 0) {
+                const auto end = line.find('\t', 8);
+                unsigned slot = 0;
+                if (end == line.npos || end + 2 >= line.size() || line[end + 2] != '\t' ||
+                    (line[end + 1] != '0' && line[end + 1] != '1'))
+                    return L"窗口配置无效，请打开设置。";
+                const auto number = std::from_chars(line.data() + 8, line.data() + end, slot);
+                const auto name = std::filesystem::u8path(line.substr(end + 3));
+                if (number.ec != std::errc{} || number.ptr != line.data() + end || !slot || !isProcessName(name))
+                    return L"窗口配置无效，请打开设置。";
+                parsed.setTaskbar(name.wstring(), slot, line[end + 1] == '1');
             } else {
                 // The first release saved a single absolute executable path.
                 const path entry = std::filesystem::u8path(line);
@@ -132,7 +171,10 @@ std::wstring save(const Config& config)
     std::ofstream out(temp, std::ios::binary | std::ios::trunc);
     if (!out)
         return L"无法写入配置目录。\n" + file.parent_path().wstring();
-    out << "reserveTaskbar=" << (config.reserveTaskbar ? "1" : "0") << '\n';
+    out << "reserveTaskbar=" << config.defaultTaskbar << '\n';
+    out << "layout=" << (config.tabbed ? "tabs" : "windows") << '\n';
+    for (const auto& pref : config.windows)
+        out << "taskbar\t" << pref.slot << '\t' << pref.taskbar << '\t' << path(pref.name).u8string() << '\n';
     for (const auto& name : config.names)
         out << path(name).u8string() << '\n';
     out.close();

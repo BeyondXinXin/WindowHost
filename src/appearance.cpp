@@ -1,6 +1,7 @@
 #include "appearance.h"
 
 #include <dwmapi.h>
+#include <algorithm>
 #include <cwchar>
 #include <iterator>
 
@@ -81,16 +82,18 @@ void Appearance::drawButton(const DRAWITEMSTRUCT& item) const
     RestoreDC(item.hDC, saved);
 }
 
-void measureDarkMenu(HWND frame, MEASUREITEMSTRUCT& item, const wchar_t* label)
+void measureHostMenu(HWND frame, MEASUREITEMSTRUCT& item, const std::wstring& label, bool gear)
 {
+    const UINT dpi = GetDpiForWindow(frame);
+    item.itemHeight = std::max(GetSystemMetricsForDpi(SM_CYMENU, dpi), MulDiv(26, dpi, 96));
+    item.itemWidth = MulDiv(30, dpi, 96);
+    if (gear) return;
     HDC dc = GetDC(frame);
     HFONT font = menuFont(frame);
     const auto old = font ? SelectObject(dc, font) : nullptr;
-    RECT size{};
-    DrawTextW(dc, label, -1, &size, DT_SINGLELINE | DT_CALCRECT);
-    const UINT dpi = GetDpiForWindow(frame);
-    item.itemWidth = size.right + MulDiv(12, dpi, 96);
-    item.itemHeight = GetSystemMetricsForDpi(SM_CYMENU, dpi);
+    RECT bounds{};
+    DrawTextW(dc, label.c_str(), -1, &bounds, DT_SINGLELINE | DT_CALCRECT | DT_NOPREFIX);
+    item.itemWidth = std::min<LONG>(bounds.right, MulDiv(260, dpi, 96)) + MulDiv(18, dpi, 96);
     if (font) {
         SelectObject(dc, old);
         DeleteObject(font);
@@ -98,22 +101,41 @@ void measureDarkMenu(HWND frame, MEASUREITEMSTRUCT& item, const wchar_t* label)
     ReleaseDC(frame, dc);
 }
 
-void drawDarkMenu(HWND frame, const DRAWITEMSTRUCT& item, const wchar_t* label, const Appearance& theme)
+void drawHostMenu(HWND frame, const DRAWITEMSTRUCT& item, const std::wstring& label,
+                  bool gear, bool selected, const Appearance& theme)
 {
-    const bool active = (item.itemState & (ODS_SELECTED | ODS_HOTLIGHT)) != 0;
-    FillRect(item.hDC, &item.rcItem, active ? theme.field() : theme.menu());
-    const int saved = SaveDC(item.hDC);
-    HFONT font = menuFont(frame);
-    if (font)
-        SelectObject(item.hDC, font);
-    SetBkMode(item.hDC, TRANSPARENT);
-    SetTextColor(item.hDC, theme.text());
+    const UINT dpi = GetDpiForWindow(frame);
     RECT rect = item.rcItem;
-    UINT flags = DT_SINGLELINE | DT_VCENTER | DT_CENTER;
-    if (item.itemState & ODS_NOACCEL)
-        flags |= DT_HIDEPREFIX;
-    DrawTextW(item.hDC, label, -1, &rect, flags);
+    const bool hot = (item.itemState & (ODS_SELECTED | ODS_HOTLIGHT)) != 0;
+    HBRUSH background = selected ? theme.background() : theme.menu();
+    FillRect(item.hDC, &rect, hot ? GetSysColorBrush(COLOR_HIGHLIGHT) : background);
+    const int saved = SaveDC(item.hDC);
+    HFONT font = gear ? CreateFontW(-MulDiv(16, dpi, 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                    DEFAULT_PITCH, L"Segoe MDL2 Assets") : menuFont(frame);
+    if (font) SelectObject(item.hDC, font);
+    SetBkMode(item.hDC, TRANSPARENT);
+    SetTextColor(item.hDC, hot ? GetSysColor(COLOR_HIGHLIGHTTEXT) : theme.text());
+    constexpr UINT flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
+    if (gear) {
+        DrawTextW(item.hDC, L"\uE713", 1, &rect, flags | DT_CENTER);
+    } else {
+        if (selected) {
+            RECT line{rect.left, rect.bottom - MulDiv(2, dpi, 96), rect.right, rect.bottom};
+            FillRect(item.hDC, &line, GetSysColorBrush(hot ? COLOR_HIGHLIGHTTEXT : COLOR_HIGHLIGHT));
+        }
+        InflateRect(&rect, -MulDiv(8, dpi, 96), 0);
+        // Preserve the PID when the executable name needs an ellipsis.
+        const auto suffix = label.rfind(L"  [");
+        if (suffix != label.npos) {
+            SIZE size{};
+            GetTextExtentPoint32W(item.hDC, label.c_str() + suffix, static_cast<int>(label.size() - suffix), &size);
+            DrawTextW(item.hDC, label.c_str() + suffix, -1, &rect, flags | DT_RIGHT);
+            rect.right -= size.cx;
+        }
+        DrawTextW(item.hDC, label.c_str(), suffix == label.npos ? -1 : static_cast<int>(suffix),
+                  &rect, flags | DT_END_ELLIPSIS);
+    }
     RestoreDC(item.hDC, saved);
-    if (font)
-        DeleteObject(font);
+    if (font) DeleteObject(font);
 }

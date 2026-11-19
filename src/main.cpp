@@ -1,4 +1,4 @@
-#include "appearance.h"
+#include "pane.h"
 #include "resource.h"
 #include "settings.h"
 #include "target.h"
@@ -11,8 +11,6 @@
 #include <vector>
 #include <iterator>
 #include <string>
-#include <system_error>
-#include <thread>
 #include <utility>
 
 namespace {
@@ -20,7 +18,7 @@ constexpr int clientWidth = 1920;
 constexpr int clientHeight = 1080;
 constexpr DWORD frameStyle = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
 constexpr wchar_t frameClass[] = L"BeyondXinXin.WindowHost.Frame";
-constexpr wchar_t viewportClass[] = L"BeyondXinXin.WindowHost.Viewport";
+constexpr UINT firstTab = 1000;
 constexpr UINT openSettings = 100;
 constexpr wchar_t settingsMenu[] = L"设置(&S)…";
 constexpr UINT focusTarget = WM_APP + 4;
@@ -58,44 +56,76 @@ struct Manager {
     Host* create(int show, HWND targetWindow = nullptr);
     bool hasOther(HWND frame, bool includeClosing = true) const;
     void poll();
-    void apply(settings::Config chosen);
+    HWND groupFrame = nullptr;
+    bool pendingLayout = false;
+    Host* group() const;
+    bool arrange(Host& primary);
+    void apply(settings::Config chosen, Host& origin);
+    unsigned nextSlot(const std::wstring& name) const;
     void ignore(DWORD pid);
+};
+
+struct DialogState {
+    Host& owner;
+    settings::Config chosen;
+    std::wstring name;
+    unsigned slot = 0;
+    std::wstring label;
 };
 
 struct Host {
     explicit Host(Manager& owner) : manager(owner) {}
-    ~Host() { if (stop) CloseHandle(stop); }
 
     Manager& manager;
     Appearance theme;
     HWND frame = nullptr;
-    HWND viewport = nullptr;
-    HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    std::thread worker;
-    target::Candidate candidate;
+    std::vector<std::unique_ptr<Pane>> panes;
+    Pane* active = nullptr;
     std::wstring notice;
-    int bottomInset = 0;
-    bool ready = false;
+    int workInset = 0;
     bool closing = false;
+
+    void rebuildMenu()
+    {
+        HMENU menu = GetMenu(frame);
+        while (GetMenuItemCount(menu) > 0) {
+            if (!DeleteMenu(menu, 0, MF_BYPOSITION)) return;
+        }
+        auto add = [&](UINT command, const wchar_t* label) {
+            MENUITEMINFOW item{sizeof(item)};
+            item.fMask = MIIM_ID | MIIM_STRING | MIIM_FTYPE;
+            item.fType = MFT_OWNERDRAW;
+            item.wID = command;
+            item.dwTypeData = const_cast<wchar_t*>(label);
+            InsertMenuItemW(menu, GetMenuItemCount(menu), TRUE, &item);
+        };
+        add(openSettings, settingsMenu);
+        if (manager.config.tabbed || panes.size() > 1) {
+            for (size_t i = 0; i < panes.size(); ++i)
+                add(firstTab + static_cast<UINT>(i), panes[i]->label.c_str());
+        }
+        DrawMenuBar(frame);
+        PostMessageW(frame, updateLayout, 0, 0);
+    }
+
+    Pane* tab(UINT command) const
+    {
+        const auto index = command - firstTab;
+        return command >= firstTab && index < panes.size() ? panes[index].get() : nullptr;
+    }
 
     void applyTheme()
     {
         theme.readSystem();
         theme.setCaption(frame);
-        HMENU menu = GetMenu(frame);
-        MENUINFO info{sizeof(MENUINFO)};
+        MENUINFO info{sizeof(info)};
         info.fMask = MIM_BACKGROUND;
-        info.hbrBack = theme.dark ? theme.menu() : nullptr;
-        SetMenuInfo(menu, &info);
-        MENUITEMINFOW item{sizeof(MENUITEMINFOW)};
-        item.fMask = MIIM_FTYPE | MIIM_STRING;
-        item.fType = theme.dark ? MFT_OWNERDRAW : MFT_STRING;
-        item.dwTypeData = const_cast<wchar_t*>(settingsMenu);
-        SetMenuItemInfoW(menu, openSettings, FALSE, &item);
+        info.hbrBack = theme.menu();
+        SetMenuInfo(GetMenu(frame), &info);
         DrawMenuBar(frame);
         RedrawWindow(frame, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_NOCHILDREN);
-        if (viewport)
-            RedrawWindow(viewport, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_NOCHILDREN);
+        for (const auto& pane : panes)
+            RedrawWindow(pane->page, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_NOCHILDREN);
     }
 
     void title(const std::wstring& detail = {}) const
@@ -104,11 +134,15 @@ struct Host {
         SetWindowTextW(frame, caption.c_str());
     }
 
+    int inset(const Pane* pane) const
+    {
+        return pane && manager.config.taskbarFor(pane->candidate.name, pane->slot) ? workInset : 0;
+    }
+
     void layoutViewport() const
     {
-        if (!viewport)
-            return;
-        SetWindowPos(viewport, nullptr, 0, 0, clientWidth, clientHeight - bottomInset, SWP_NOZORDER | SWP_NOACTIVATE);
+        for (const auto& pane : panes)
+            pane->resize({clientWidth, clientHeight - inset(pane.get())});
     }
 
     void correctClientSize() const
@@ -130,11 +164,10 @@ struct Host {
             return;
         int inset = 0;
         MONITORINFO monitor{sizeof(MONITORINFO)};
-        if (manager.config.reserveTaskbar &&
-            GetMonitorInfoW(MonitorFromWindow(frame, MONITOR_DEFAULTTONEAREST), &monitor))
+        if (GetMonitorInfoW(MonitorFromWindow(frame, MONITOR_DEFAULTTONEAREST), &monitor))
             inset = std::clamp<int>(monitor.rcMonitor.bottom - monitor.rcWork.bottom, 0, clientHeight - 1);
-        if (inset != bottomInset) {
-            bottomInset = inset;
+        if (inset != workInset) {
+            workInset = inset;
             layoutViewport();
             InvalidateRect(frame, nullptr, TRUE);
         }
@@ -146,67 +179,97 @@ struct Host {
             SetForegroundWindow(manager.dialog);
             return;
         }
-        if (!closing && DialogBoxParamW(manager.instance, MAKEINTRESOURCEW(IDD_SETTINGS), frame,
-                                        settingsProc, reinterpret_cast<LPARAM>(this)) == -1)
+        if (closing)
+            return;
+        DialogState state{*this, manager.config};
+        if (active) {
+            state.name = active->candidate.name;
+            state.slot = active->slot;
+            state.label = active->label;
+        }
+        const auto result = DialogBoxParamW(manager.instance, MAKEINTRESOURCEW(IDD_SETTINGS), frame,
+                                            settingsProc, reinterpret_cast<LPARAM>(&state));
+        if (result == IDOK)
+            manager.apply(std::move(state.chosen), *this);
+        else if (result == -1)
             MessageBoxW(frame, L"无法打开设置窗口。", L"WindowHost", MB_OK | MB_ICONERROR);
     }
 
-    DWORD start()
+    void select(Pane* next, bool focus)
     {
-        const auto context = GetWindowDpiAwarenessContext(candidate.window);
-        const auto previous = SetThreadDpiAwarenessContext(context);
-        if (!previous)
-            return ERROR_INVALID_STATE;
-        viewport = CreateWindowExW(0, viewportClass, nullptr, WS_CHILD | WS_CLIPCHILDREN | WS_VISIBLE,
-                                   0, 0, 0, 0, frame, nullptr, GetModuleHandleW(nullptr), &theme);
-        const DWORD error = viewport ? ERROR_SUCCESS : GetLastError();
-        SetThreadDpiAwarenessContext(previous);
-        if (!viewport)
-            return error ? error : ERROR_GEN_FAILURE;
-        if (!AreDpiAwarenessContextsEqual(context, GetWindowDpiAwarenessContext(viewport))) {
-            DestroyWindow(viewport);
-            viewport = nullptr;
-            return ERROR_INVALID_STATE;
+        if (active && active != next)
+            active->show(false);
+        active = next;
+        if (active) {
+            active->resize({clientWidth, clientHeight - inset(active)});
+            active->show(true);
         }
-        layoutViewport();
-        ResetEvent(stop);
-        try {
-            worker = std::thread([window = frame, pane = viewport, id = candidate, cancel = stop] {
-                const DWORD result = target::host(window, pane, id, cancel);
-                PostMessageW(window, target::finished, result, 0);
-            });
-        } catch (const std::system_error&) {
-            DestroyWindow(viewport);
-            viewport = nullptr;
-            return ERROR_NO_SYSTEM_RESOURCES;
-        }
-        title(L"正在嵌入 " + candidate.name);
+        title(active ? active->label : std::wstring{});
+        DrawMenuBar(frame);
+        InvalidateRect(frame, nullptr, TRUE);
+        if (focus)
+            PostMessageW(frame, focusTarget, 0, 0);
+    }
+
+    DWORD start(const target::Candidate& candidate)
+    {
+        auto pane = std::make_unique<Pane>(candidate, manager.nextSlot(candidate.name));
+        const DWORD error = pane->start(frame, theme, {clientWidth, clientHeight - inset(pane.get())});
+        if (error)
+            return error;
+        panes.push_back(std::move(pane));
+        rebuildMenu();
+        if (!active)
+            select(panes.back().get(), false);
         return ERROR_SUCCESS;
     }
 
-    void finish(DWORD error)
+    bool transfer(Pane* pane, Host& destination)
     {
-        if (!worker.joinable())
+        auto it = std::find_if(panes.begin(), panes.end(), [pane](const auto& p) { return p.get() == pane; });
+        if (it == panes.end())
+            return false;
+        pane->show(false);
+        if (!pane->moveTo(destination.frame, destination.theme)) {
+            if (active == pane) pane->show(true);
+            return false;
+        }
+        destination.panes.push_back(std::move(*it));
+        panes.erase(it);
+        if (active == pane) {
+            active = nullptr;
+            select(panes.empty() ? nullptr : panes.front().get(), false);
+        }
+        if (!destination.active)
+            destination.select(pane, false);
+        return true;
+    }
+
+    void finish(Pane* pane, DWORD error)
+    {
+        const auto it = std::find_if(panes.begin(), panes.end(), [pane](const auto& p) { return p.get() == pane; });
+        if (it == panes.end())
             return;
-        worker.join();
-        ready = false;
-        DestroyWindow(viewport);
-        viewport = nullptr;
-        notice.clear();
+        pane->join();
         if (error && error != ERROR_INVALID_WINDOW_HANDLE && error != ERROR_CANCELLED) {
-            notice = candidate.name + L"  " + captureError(error);
-            manager.retries[candidate.pid] = GetTickCount64() + 3000;
+            notice = pane->candidate.name + L"  " + captureError(error);
+            manager.retries[pane->candidate.pid] = GetTickCount64() + 3000;
         }
-        candidate = {};
-        const bool ownsDialog = manager.dialog && GetWindow(manager.dialog, GW_OWNER) == frame;
-        if (closing || (notice.empty() && !ownsDialog && manager.hasOther(frame, false))) {
-            if (closing && !notice.empty())
-                MessageBoxW(frame, notice.c_str(), L"WindowHost", MB_OK | MB_ICONWARNING);
-            DestroyWindow(frame);
-        } else {
-            title();
-            InvalidateRect(frame, nullptr, TRUE);
+        const size_t index = static_cast<size_t>(it - panes.begin());
+        const bool selected = active == pane;
+        if (selected) active = nullptr;
+        panes.erase(it);
+        if (panes.empty()) {
+            const bool ownsDialog = manager.dialog && GetWindow(manager.dialog, GW_OWNER) == frame;
+            if (closing || (notice.empty() && !ownsDialog && manager.hasOther(frame, false) &&
+                            (!manager.config.tabbed || manager.group() != this))) {
+                DestroyWindow(frame);
+                return;
+            }
         }
+        rebuildMenu();
+        if (selected)
+            select(panes.empty() ? nullptr : panes[std::min(index, panes.size() - 1)].get(), !closing);
     }
 
     void close()
@@ -215,24 +278,15 @@ struct Host {
             return;
         closing = true;
         KillTimer(frame, 1);
-        if (worker.joinable()) {
-            manager.ignore(candidate.pid);
-            ready = false;
-            SetEvent(stop);
-            title(L"正在释放目标窗口，若停在断点请继续运行");
-        } else {
+        if (panes.empty()) {
             DestroyWindow(frame);
-        }
-    }
-
-    void forwardFocus() const
-    {
-        if (!ready || !viewport || GetForegroundWindow() != frame || GetFocus() != frame)
             return;
-        HWND window = candidate.window;
-        if (IsChild(viewport, window) && IsWindowEnabled(window) && IsWindowVisible(window) &&
-            !IsHungAppWindow(window))
-            SetFocus(window);
+        }
+        for (const auto& pane : panes) {
+            manager.ignore(pane->candidate.pid);
+            pane->release();
+        }
+        title(L"正在释放目标窗口，若停在断点请继续运行");
     }
 
     void paint() const
@@ -252,6 +306,7 @@ struct Host {
         const int pad = MulDiv(32, dpi, 96);
         rect.left += pad;
         rect.right -= pad;
+        const int bottomInset = inset(active);
         if (bottomInset) {
             RECT strip{0, rect.bottom - bottomInset, clientWidth, rect.bottom};
             FillRect(dc, &strip, theme.dark ? theme.menu() : GetSysColorBrush(COLOR_BTNFACE));
@@ -283,9 +338,13 @@ struct Host {
 
 INT_PTR CALLBACK settingsProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
 {
-    auto* app = reinterpret_cast<Host*>(GetWindowLongPtrW(dialog, DWLP_USER));
+    auto* state = reinterpret_cast<DialogState*>(GetWindowLongPtrW(dialog, DWLP_USER));
+    if (message == WM_INITDIALOG)
+        state = reinterpret_cast<DialogState*>(lp);
+    if (!state)
+        return FALSE;
+    Host* app = &state->owner;
     if (message == WM_INITDIALOG) {
-        app = reinterpret_cast<Host*>(lp);
         SetWindowLongPtrW(dialog, DWLP_USER, lp);
         app->theme.setCaption(dialog);
         app->manager.dialog = dialog;
@@ -294,11 +353,15 @@ INT_PTR CALLBACK settingsProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
             names += name + L"\r\n";
         SendDlgItemMessageW(dialog, IDC_PROCESS_NAMES, EM_SETLIMITTEXT, 32767, 0);
         SetDlgItemTextW(dialog, IDC_PROCESS_NAMES, names.c_str());
-        CheckDlgButton(dialog, IDC_TASKBAR, app->manager.config.reserveTaskbar ? BST_CHECKED : BST_UNCHECKED);
+        CheckRadioButton(dialog, IDC_LAYOUT_TABS, IDC_LAYOUT_WINDOWS,
+                         state->chosen.tabbed ? IDC_LAYOUT_TABS : IDC_LAYOUT_WINDOWS);
+        EnableWindow(GetDlgItem(dialog, IDC_TASKBAR), state->slot != 0);
+        if (state->slot) {
+            CheckDlgButton(dialog, IDC_TASKBAR, state->chosen.taskbarFor(state->name, state->slot) ? BST_CHECKED : BST_UNCHECKED);
+            SetWindowTextW(dialog, (L"设置 — " + state->label).c_str());
+        }
         return TRUE;
     }
-    if (!app)
-        return FALSE;
     switch (message) {
     case WM_COMMAND:
         if (LOWORD(wp) == IDCANCEL) {
@@ -310,13 +373,14 @@ INT_PTR CALLBACK settingsProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
             std::wstring lines(static_cast<size_t>(GetWindowTextLengthW(edit)) + 1, L'\0');
             const int copied = GetWindowTextW(edit, lines.data(), static_cast<int>(lines.size()));
             lines.resize(copied);
-            settings::Config chosen;
-            chosen.reserveTaskbar = IsDlgButtonChecked(dialog, IDC_TASKBAR) == BST_CHECKED;
+            auto& chosen = state->chosen;
+            chosen.tabbed = IsDlgButtonChecked(dialog, IDC_LAYOUT_TABS) == BST_CHECKED;
+            if (state->slot)
+                chosen.setTaskbar(state->name, state->slot, IsDlgButtonChecked(dialog, IDC_TASKBAR) == BST_CHECKED);
             auto error = settings::parseNames(lines, chosen);
             if (error.empty())
                 error = settings::save(chosen);
             if (error.empty()) {
-                app->manager.apply(std::move(chosen));
                 EndDialog(dialog, IDOK);
             } else {
                 MessageBoxW(dialog, error.c_str(), L"WindowHost", MB_OK | MB_ICONWARNING);
@@ -356,23 +420,6 @@ INT_PTR CALLBACK settingsProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
     return FALSE;
 }
 
-LRESULT CALLBACK viewportProc(HWND window, UINT message, WPARAM wp, LPARAM lp)
-{
-    if (message == WM_NCCREATE)
-        SetWindowLongPtrW(window, GWLP_USERDATA,
-                          reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams));
-    if (message == WM_ERASEBKGND) {
-        const auto* theme = reinterpret_cast<const Appearance*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-        if (theme) {
-            RECT rect{};
-            GetClientRect(window, &rect);
-            FillRect(reinterpret_cast<HDC>(wp), &rect, theme->background());
-            return 1;
-        }
-    }
-    return DefWindowProcW(window, message, wp, lp);
-}
-
 LRESULT CALLBACK frameProc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 {
     auto* app = reinterpret_cast<Host*>(GetWindowLongPtrW(window, GWLP_USERDATA));
@@ -387,6 +434,10 @@ LRESULT CALLBACK frameProc(HWND window, UINT message, WPARAM wp, LPARAM lp)
     case WM_COMMAND:
         if (!lp && LOWORD(wp) == openSettings)
             app->settings();
+        else if (!lp && !app->closing) {
+            if (auto* tab = app->tab(LOWORD(wp)))
+                app->select(tab, true);
+        }
         return 0;
     case WM_SETTINGCHANGE:
     case WM_THEMECHANGED:
@@ -406,22 +457,28 @@ LRESULT CALLBACK frameProc(HWND window, UINT message, WPARAM wp, LPARAM lp)
     }
     case WM_MEASUREITEM: {
         auto& item = *reinterpret_cast<MEASUREITEMSTRUCT*>(lp);
-        if (item.CtlType == ODT_MENU && item.itemID == openSettings) {
-            measureDarkMenu(window, item, settingsMenu);
-            return TRUE;
+        if (item.CtlType == ODT_MENU) {
+            Pane* tab = app->tab(item.itemID);
+            if (tab || item.itemID == openSettings) {
+                measureHostMenu(window, item, tab ? tab->label : L"", !tab);
+                return TRUE;
+            }
         }
         break;
     }
     case WM_DRAWITEM: {
         const auto& item = *reinterpret_cast<DRAWITEMSTRUCT*>(lp);
-        if (item.CtlType == ODT_MENU && item.itemID == openSettings) {
-            drawDarkMenu(window, item, settingsMenu, app->theme);
-            return TRUE;
+        if (item.CtlType == ODT_MENU) {
+            Pane* tab = app->tab(item.itemID);
+            if (tab || item.itemID == openSettings) {
+                drawHostMenu(window, item, tab ? tab->label : L"", !tab, tab && app->active == tab, app->theme);
+                return TRUE;
+            }
         }
         break;
     }
     case WM_MENUCHAR:
-        if (app->theme.dark && reinterpret_cast<HMENU>(lp) == GetMenu(window)) {
+        if (reinterpret_cast<HMENU>(lp) == GetMenu(window)) {
             if (LOWORD(wp) == L's' || LOWORD(wp) == L'S')
                 return MAKELRESULT(0, MNC_EXECUTE);
         }
@@ -467,24 +524,32 @@ LRESULT CALLBACK frameProc(HWND window, UINT message, WPARAM wp, LPARAM lp)
             return 0;
         break;
     case target::attached:
-        if (!app->closing && WaitForSingleObject(app->stop, 0) == WAIT_TIMEOUT) {
-            app->ready = true;
-            app->title(app->candidate.name + L"  [" + std::to_wstring(app->candidate.pid) + L"]");
-            PostMessageW(window, focusTarget, 0, 0);
+    case target::restoring:
+    case target::finished: {
+        auto it = std::find_if(app->panes.begin(), app->panes.end(), [lp](const auto& pane) {
+            return reinterpret_cast<LPARAM>(pane.get()) == lp;
+        });
+        if (it == app->panes.end())
+            return 0;
+        Pane* pane = it->get();
+        if (message == target::finished)
+            app->finish(pane, static_cast<DWORD>(wp));
+        else if (message == target::restoring) {
+            pane->releasing = true;
+            if (pane == app->active) app->title(L"正在等待目标释放窗口");
+        } else {
+            pane->ready = true;
+            if (pane == app->active && GetFocus() == window)
+                PostMessageW(window, focusTarget, 0, 0);
         }
         return 0;
-    case target::restoring:
-        app->ready = false;
-        app->title(L"正在等待目标释放窗口");
-        return 0;
-    case target::finished:
-        app->finish(static_cast<DWORD>(wp));
-        return 0;
+    }
     case WM_SETFOCUS:
         PostMessageW(window, focusTarget, 0, 0);
         break;
     case focusTarget:
-        app->forwardFocus();
+        if (app->active && !app->closing && !app->manager.dialog && GetForegroundWindow() == window)
+            app->active->focus();
         return 0;
     case WM_CLOSE:
         app->close();
@@ -523,36 +588,106 @@ void Manager::ignore(DWORD pid)
         ignored.emplace(pid, process);
 }
 
-void Manager::apply(settings::Config chosen)
+Host* Manager::group() const
 {
+    Host* first = nullptr;
+    for (const auto& host : hosts) {
+        if (!host->frame || host->closing) continue;
+        if (host->frame == groupFrame) return host.get();
+        if (!first) first = host.get();
+    }
+    return first;
+}
+
+unsigned Manager::nextSlot(const std::wstring& name) const
+{
+    std::vector<unsigned> occupied;
+    for (const auto& host : hosts)
+        for (const auto& pane : host->panes)
+            if (CompareStringOrdinal(name.c_str(), -1, pane->candidate.name.c_str(), -1, TRUE) == CSTR_EQUAL)
+                occupied.push_back(pane->slot);
+    std::sort(occupied.begin(), occupied.end());
+    unsigned slot = 1;
+    for (unsigned used : occupied) {
+        if (slot != used) break;
+        ++slot;
+    }
+    return slot;
+}
+
+bool Manager::arrange(Host& primary)
+{
+    // Creating split windows may grow hosts. Only visit the original windows.
+    const size_t count = hosts.size();
+    bool complete = true;
+    for (size_t i = 0; i < count; ++i) {
+        Host& source = *hosts[i];
+        if (!source.frame || source.closing) continue;
+        if (config.tabbed && &source != &primary) {
+            while (!source.panes.empty()) {
+                if (!source.transfer(source.panes.front().get(), primary)) {
+                    complete = false;
+                    break;
+                }
+            }
+            if (source.panes.empty())
+                DestroyWindow(source.frame);
+        } else if (!config.tabbed) {
+            while (source.panes.size() > 1) {
+                Pane* moving = source.panes.back().get();
+                if (moving == source.active) moving = source.panes.front().get();
+                Host* dest = create(SW_HIDE, source.frame);
+                if (!dest || !source.transfer(moving, *dest)) {
+                    if (dest) DestroyWindow(dest->frame);
+                    complete = false;
+                    break;
+                }
+                ShowWindow(dest->frame, SW_SHOWNOACTIVATE);
+            }
+        }
+    }
+    for (const auto& host : hosts) {
+        if (!host->frame || host->closing) continue;
+        host->updateInset();
+        host->layoutViewport();
+        host->rebuildMenu();
+        InvalidateRect(host->frame, nullptr, TRUE);
+    }
+    return complete;
+}
+
+void Manager::apply(settings::Config chosen, Host& origin)
+{
+    const bool layoutChanged = config.tabbed != chosen.tabbed;
     config = std::move(chosen);
     previous.clear();
     retries.clear();
     nextScan = 0;
-    for (auto& host : hosts) {
-        if (!host->frame || host->closing)
-            continue;
+    if (layoutChanged || pendingLayout) {
+        groupFrame = origin.frame;
+        pendingLayout = !arrange(origin);
+        if (pendingLayout)
+            MessageBoxW(origin.frame, L"部分窗口暂时无法移动，WindowHost 将自动重试。", L"WindowHost", MB_OK | MB_ICONWARNING);
+    }
+    for (const auto& host : hosts) {
+        if (!host->frame || host->closing) continue;
         host->notice.clear();
         host->updateInset();
-        if (host->worker.joinable() && !config.watches(host->candidate.name)) {
-            host->ready = false;
-            SetEvent(host->stop);
-            host->title(L"正在释放目标窗口");
-        }
+        host->layoutViewport();
         InvalidateRect(host->frame, nullptr, TRUE);
+        for (const auto& pane : host->panes) {
+            if (!config.watches(pane->candidate.name))
+                pane->release();
+        }
     }
 }
 
 Host* Manager::create(int show, HWND targetWindow)
 {
     auto host = std::make_unique<Host>(*this);
-    if (!host->stop)
-        return nullptr;
     HMENU menu = CreateMenu();
-    if (!menu || !AppendMenuW(menu, MF_STRING, openSettings, settingsMenu)) {
-        if (menu) DestroyMenu(menu);
+    if (!menu)
         return nullptr;
-    }
     POINT cursor{};
     GetCursorPos(&cursor);
     HMONITOR display = targetWindow ? MonitorFromWindow(targetWindow, MONITOR_DEFAULTTONEAREST)
@@ -575,6 +710,7 @@ Host* Manager::create(int show, HWND targetWindow)
         return nullptr;
     }
     app->applyTheme();
+    app->rebuildMenu();
     const auto size = frameSize(GetDpiForWindow(window));
     const LONG cascade = static_cast<LONG>((hosts.size() - 1) % 6) * 24;
     const LONG availableX = std::max(0L, work.right - work.left - size.cx);
@@ -610,6 +746,10 @@ void Manager::poll()
         else
             ++it;
     }
+    if (pendingLayout) {
+        if (auto* root = group()) pendingLayout = !arrange(*root);
+        if (pendingLayout) nextScan = now + 3000;
+    }
     if (config.names.empty())
         return;
 
@@ -625,35 +765,31 @@ void Manager::poll()
         Host* idle = nullptr;
         bool bound = false;
         for (const auto& host : hosts) {
-            if (host->worker.joinable() && host->candidate.pid == candidate.pid) {
-                bound = true;
-                break;
-            }
-            if (!idle && host->frame && !host->closing && !host->worker.joinable())
+            bound = std::any_of(host->panes.begin(), host->panes.end(), [&](const auto& pane) {
+                return pane->candidate.pid == candidate.pid;
+            });
+            if (bound) break;
+            if (!idle && host->frame && !host->closing && host->panes.empty())
                 idle = host.get();
         }
         if (bound)
             continue;
-        if (!idle)
-            idle = create(SW_SHOWNOACTIVATE, candidate.window);
-        if (!idle) {
+        Host* home = config.tabbed ? group() : idle;
+        if (!home)
+            home = create(SW_SHOWNOACTIVATE, candidate.window);
+        if (!home) {
             retries[candidate.pid] = now + 3000;
-            for (const auto& host : hosts) {
-                if (host->frame && !host->closing) {
-                    host->title(L"无法为 " + candidate.name + L" 创建窗口");
-                    break;
-                }
-            }
+            if (auto* root = group()) root->title(L"无法为 " + candidate.name + L" 创建窗口");
             continue;
         }
-        idle->candidate = candidate;
-        idle->notice.clear();
-        const DWORD error = idle->start();
+        const DWORD error = home->start(candidate);
         if (error) {
             retries[candidate.pid] = now + 3000;
-            idle->notice = candidate.name + L"  " + captureError(error);
-            idle->candidate = {};
-            InvalidateRect(idle->frame, nullptr, TRUE);
+            home->notice = candidate.name + L"  " + captureError(error);
+            home->title(home->notice);
+            InvalidateRect(home->frame, nullptr, TRUE);
+        } else {
+            home->notice.clear();
         }
     }
     previous = std::move(found);
@@ -671,9 +807,7 @@ int run(HINSTANCE instance, int show)
     cls.lpszClassName = frameClass;
     if (!RegisterClassExW(&cls))
         return 1;
-    cls.lpfnWndProc = viewportProc;
-    cls.lpszClassName = viewportClass;
-    if (!RegisterClassExW(&cls))
+    if (!Pane::registerClass(instance))
         return 1;
 
     Manager manager{instance};

@@ -111,7 +111,7 @@ DWORD changeParent(HWND window, HWND parent)
 }
 
 struct Session {
-    HWND frame;
+    HWND notify;
     HWND viewport;
     Candidate id;
     HANDLE process;
@@ -194,7 +194,7 @@ struct Session {
 
     DWORD follow() const
     {
-        PostMessageW(frame, attached, 0, 0);
+        PostMessageW(notify, attached, 0, 0);
         const HANDLE signals[] = {stop, process};
         unsigned hiddenTicks = 0;
         while (WaitForMultipleObjects(2, signals, FALSE, 400) == WAIT_TIMEOUT && alive()) {
@@ -206,7 +206,7 @@ struct Session {
                 continue;
             }
             hiddenTicks = 0;
-            if (IsIconic(frame))
+            if (IsIconic(GetAncestor(viewport, GA_ROOT)))
                 continue;
             bool changed = false;
             DWORD error = childStyles(changed);
@@ -235,7 +235,7 @@ struct Session {
             parent = GetAncestor(window, GA_PARENT);
             if (parent == viewport) {
                 if (!notified)
-                    PostMessageW(frame, restoring, 0, 0);
+                    PostMessageW(notify, restoring, 0, 0);
                 notified = true;
                 WaitForSingleObject(process, 500);
             }
@@ -276,7 +276,7 @@ std::vector<Candidate> findMainWindows(const std::vector<std::wstring>& names)
     return result;
 }
 
-DWORD host(HWND frame, HWND viewport, const Candidate& candidate, HANDLE stop)
+DWORD host(HWND notify, HWND viewport, const Candidate& candidate, HANDLE stop)
 {
     HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, candidate.pid);
     if (!process)
@@ -286,7 +286,7 @@ DWORD host(HWND frame, HWND viewport, const Candidate& candidate, HANDLE stop)
     if (CompareStringOrdinal(actual.c_str(), -1, candidate.name.c_str(), -1, TRUE) == CSTR_EQUAL) {
         const auto previous = SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(viewport));
         if (previous) {
-            Session session{frame, viewport, candidate, process, stop};
+            Session session{notify, viewport, candidate, process, stop};
             result = session.attach();
             if (!result)
                 result = session.follow();

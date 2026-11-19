@@ -18,7 +18,6 @@ constexpr UINT attached = WM_APP + 1;
 constexpr UINT restoring = WM_APP + 2;
 constexpr UINT finished = WM_APP + 3;
 
-// Run on a worker. The UI owns frame, viewport and the manual-reset stop event
-// until this returns. A finished session leaves no foreign child in viewport.
-DWORD host(HWND frame, HWND viewport, const Candidate& candidate, HANDLE stop);
+// The notification window and viewport travel with their page and outlive the worker.
+DWORD host(HWND notify, HWND viewport, const Candidate& candidate, HANDLE stop);
 }
